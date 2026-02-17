@@ -1,0 +1,4 @@
+{:lint-as {workshop.client/defn clojure.core/defn}
+ :linters {:namespace-name-mismatch {:level :off}
+           :redefined-var {:level :off}
+           :duplicate-require {:level :off}}}

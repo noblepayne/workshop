@@ -1,0 +1,8 @@
+workshop.db
+workshop.db-journal
+workshop.db-wal
+workshop.db-shm
+blobs/
+.clj-kondo/.cache/
+*.log
+.DS_Store
