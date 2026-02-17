@@ -1,0 +1,36 @@
+{:deps {http-kit/http-kit {:mvn/version "2.8.0"}
+        cheshire/cheshire {:mvn/version "5.13.0"}}
+
+ :pods {org.babashka/go-sqlite3 {:version "0.3.13"}}
+
+ :tasks {:requires ([babashka.fs :as fs]
+                    [babashka.process :as p]
+                    [clojure.string :as str])
+
+         start  {:doc "Start the workshop server"
+                 :task (clojure.core/load-file "workshop.bb")}
+
+         dev    {:doc "Start with verbose logging"
+                 :task (do (System/setProperty "workshop.verbose" "true")
+                           (clojure.core/load-file "workshop.bb"))}
+
+         lint   {:doc "Run clj-kondo linter"
+                 :task (do (println "Running clj-kondo...")
+                           (p/shell "nix" "run" "nixpkgs#clj-kondo" "--" "--lint" "workshop.bb" "client.bb"))}
+
+         fmt    {:doc "Check formatting with cljfmt"
+                 :task (do (println "Checking formatting...")
+                           (p/shell "nix" "run" "nixpkgs#cljfmt" "--" "check" "workshop.bb" "client.bb"))}
+
+         test   {:doc "Run smoke tests against local server"
+                 :task (do (println "Starting test server...")
+                           (let [server (p/process "bb" "workshop.bb" {:out :inherit})]
+                             (Thread/sleep 2000)
+                             (try
+                               (println "Running tests...")
+                               (p/shell "curl" "-s" "-X" "POST" "http://localhost:4242/ch/test"
+                                        "-H" "Content-Type: application/json"
+                                        "-d" "{\"from\":\"test\",\"type\":\"test\",\"body\":{}}")
+                               (println "✓ All tests passed")
+                               (finally
+                                 (p/destroy-tree server)))))}}}
