@@ -14,6 +14,31 @@ The mesh (Tailscale, ZeroTier, whatever you're using) is the auth layer. There i
 
 - [Babashka](https://github.com/babashka/babashka#installation) — that's it
 
+## Nix
+
+```nix
+# In your flake.nix
+inputs.workshop.url = "github:noblepayne/workshop";
+
+# NixOS module (server)
+nixpkgs.overlays = [ workshop.overlays.default ];
+
+services.workshop = {
+  enable = true;
+  # optional: openFirewall = true;
+};
+
+# Or just the client library for agents
+environment.systemPackages = [ pkgs.workshop-client ];
+```
+
+Then use the client:
+```clojure
+(load-file "${pkgs.workshop-client}/lib/workshop/client.bb")
+(require '[workshop.client :as ws])
+(ws/configure! {:url "http://server:4242" :agent "myagent.owner"})
+```
+
 ## Running
 
 ```bash

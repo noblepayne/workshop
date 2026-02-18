@@ -10,45 +10,71 @@
     self,
     nixpkgs,
     flake-utils,
-  }:
-    flake-utils.lib.eachDefaultSystem (
+  }: let
+    systems = flake-utils.lib.defaultSystems;
+
+    makeWorkshopServer = pkgs:
+      pkgs.stdenv.mkDerivation {
+        pname = "workshop-server";
+        version = "0.1.0";
+
+        src = ./.;
+
+        nativeBuildInputs = [pkgs.makeWrapper];
+        buildInputs = [pkgs.babashka];
+
+        installPhase = ''
+          mkdir -p $out/bin $out/share/workshop
+
+          cp -r . $out/share/workshop/
+
+          makeWrapper ${pkgs.babashka}/bin/bb $out/bin/workshop \
+            --prefix PATH : ${pkgs.babashka}/bin \
+            --run "cd $out/share/workshop && exec bb workshop.bb" \
+            --set WORKSHOP_DIR "$out/share/workshop"
+        '';
+
+        meta = with pkgs.lib; {
+          description = "workshop server - shared workspace for agents";
+          homepage = "https://github.com/noblepayne/workshop";
+          license = licenses.mit;
+          maintainers = [];
+          platforms = platforms.unix;
+        };
+      };
+
+    makeWorkshopClient = pkgs:
+      pkgs.stdenv.mkDerivation {
+        pname = "workshop-client";
+        version = "0.1.0";
+
+        src = ./.;
+
+        installPhase = ''
+          mkdir -p $out/lib/workshop
+          cp client.bb $out/lib/workshop/
+        '';
+
+        meta = with pkgs.lib; {
+          description = "workshop client library for babashka agents";
+          homepage = "https://github.com/noblepayne/workshop";
+          license = licenses.mit;
+          maintainers = [];
+          platforms = platforms.unix;
+        };
+      };
+  in
+    flake-utils.lib.eachSystem systems (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
-
-        babashka = pkgs.babashka;
-
-        workshop = pkgs.stdenv.mkDerivation {
-          pname = "workshop";
-          version = "0.1.0";
-
-          src = ./.;
-
-          nativeBuildInputs = [pkgs.makeWrapper];
-          buildInputs = [babashka];
-
-          installPhase = ''
-            mkdir -p $out/bin $out/share/workshop
-
-            cp -r . $out/share/workshop/
-
-            makeWrapper ${babashka}/bin/bb $out/bin/workshop \
-              --prefix PATH : ${babashka}/bin \
-              --run "cd $out/share/workshop && exec bb workshop.bb" \
-              --set WORKSHOP_DIR "$out/share/workshop"
-          '';
-
-          meta = with pkgs.lib; {
-            description = "Shared workspace for a small trusted mesh of agents";
-            homepage = "https://github.com/noblepayne/workshop";
-            license = licenses.mit;
-            maintainers = [];
-            platforms = platforms.unix;
-          };
-        };
+        workshop-server = makeWorkshopServer pkgs;
+        workshop-client = makeWorkshopClient pkgs;
       in {
         formatter = pkgs.alejandra;
         packages = {
-          default = workshop;
+          default = workshop-server;
+          workshop-server = workshop-server;
+          workshop-client = workshop-client;
         };
 
         devShells.default = pkgs.mkShell {
@@ -80,7 +106,7 @@
         apps = {
           default = {
             type = "app";
-            program = "${workshop}/bin/workshop";
+            program = "${workshop-server}/bin/workshop";
             meta = {
               description = "Start workshop server";
             };
@@ -97,11 +123,16 @@
       }:
         with lib; let
           cfg = config.services.workshop;
-
-          workshop-pkg = self.packages.${pkgs.system}.default;
+          workshop-pkg = makeWorkshopServer pkgs;
         in {
           options.services.workshop = {
             enable = mkEnableOption "workshop agent workspace server";
+
+            package = mkOption {
+              type = types.package;
+              default = workshop-pkg;
+              description = "The workshop package to use";
+            };
 
             port = mkOption {
               type = types.port;
@@ -162,6 +193,7 @@
             users.users.${cfg.user} = {
               isSystemUser = true;
               group = cfg.group;
+              home = "/var/lib/workshop";
               description = "workshop service user";
             };
 
@@ -174,6 +206,7 @@
 
               environment = {
                 HOME = "/var/lib/workshop";
+                XDG_CACHE_HOME = "/var/lib/workshop/.cache";
                 PORT = toString cfg.port;
                 HOST = cfg.host;
                 DB_PATH = "/var/lib/workshop/workshop.db";
@@ -189,15 +222,15 @@
                 Type = "simple";
                 User = cfg.user;
                 Group = cfg.group;
-                ExecStart = "${workshop-pkg}/bin/workshop";
+                ExecStart = "${cfg.package}/bin/workshop";
                 Restart = "on-failure";
                 RestartSec = "5s";
                 StateDirectory = "workshop";
 
                 NoNewPrivileges = true;
                 PrivateTmp = true;
-                ProtectSystem = "strict";
-                ProtectHome = true;
+                #ProtectSystem = "strict";
+                #ProtectHome = "read-only";
 
                 MemoryMax = "1G";
                 TasksMax = 50;
@@ -207,5 +240,10 @@
             networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [cfg.port];
           };
         };
+
+      overlays.default = final: prev: {
+        workshop-server = makeWorkshopServer prev;
+        workshop-client = makeWorkshopClient prev;
+      };
     };
 }
