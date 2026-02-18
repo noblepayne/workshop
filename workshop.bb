@@ -1253,6 +1253,31 @@ function populateComposeChannels() {
   });
 }
 
+async function handleFileUpload(inp) {
+  const file = inp.files[0];
+  if (!file) return;
+  try {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const resp = await fetch(BASE + '/files', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/octet-stream'},
+      body: bytes
+    });
+    if (!resp.ok) throw new Error('upload failed');
+    const result = await resp.json();
+    alert('Uploaded: ' + result.hash + ' (' + result.size + ' bytes)');
+    const from = document.querySelector('#compose input[name=from]').value || 'human.you';
+    const ch = document.querySelector('#compose select').value || 'general';
+    await fetch(BASE + '/ch/' + ch, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({from: from, type: 'file.uploaded', body: {filename: file.name, hash: result.hash, size: result.size}})
+    });
+  } catch(e) { alert('Upload failed: ' + e.message); }
+  inp.value = '';
+}
+
 function composeEnter(inp) {
   if (event.key === 'Enter') composeSend();
 }
