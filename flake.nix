@@ -46,6 +46,7 @@
           };
         };
       in {
+        formatter = pkgs.alejandra;
         packages = {
           default = workshop;
         };
@@ -177,7 +178,10 @@
                 HOST = cfg.host;
                 DB_PATH = "/var/lib/workshop/workshop.db";
                 BLOBS_DIR = "/var/lib/workshop/blobs";
-                WORKSHOP_VERBOSE = if cfg.verbose then "true" else "false";
+                WORKSHOP_VERBOSE =
+                  if cfg.verbose
+                  then "true"
+                  else "false";
                 WORKSHOP_RETENTION_DAYS = toString cfg.retentionDays;
               };
 
