@@ -74,9 +74,18 @@
             (assert (string? body))
             (assert (seq body))))
 
-  (test! "task create"
-         #(let [r (POST "/tasks" {:from "test" :title "test task" :context {}})]
-            (assert (string? (:id r)))))
+  (test! "task create with :from"
+    #(let [r (POST "/tasks" {:from "test" :title "test task" :context {}})]
+       (assert (string? (:id r)))))
+
+  (test! "task create with :created_by"
+    #(let [r (POST "/tasks" {:created_by "test" :title "test task with created_by" :context {}})]
+       (assert (string? (:id r)))))
+
+  (test! "task create requires :from or :created_by"
+    #(let [resp (POST* "/tasks" {:title "no creator" :context {}})]
+       (assert (= 400 (:status resp)))
+       (assert (:error (:body resp)))))
 
   (test! "task list"
          #(let [tasks (GET "/tasks")]

@@ -165,12 +165,14 @@
   (let [payload (str "data: " msg-str "\n\n")]
     (doseq [client (get @subscribers ch #{})]
       (try (http/send! client payload)
-           (catch Exception _ (unsub! ch client))))
+           (catch Exception e
+             (when verbose? (println "[broadcast] send error:" (.getMessage e))))))
     ;; also send to god-view (:all)
     (when (not= ch :all)
       (doseq [client (get @subscribers :all #{})]
         (try (http/send! client payload)
-             (catch Exception _ (unsub! :all client)))))))
+             (catch Exception e
+               (when verbose? (println "[broadcast] send error (all):" (.getMessage e)))))))))
 
 (defn sse-keepalive! []
   (future
@@ -213,14 +215,14 @@
       (assoc :reply-to (:reply_to row))))
 
 (defn msg->row [msg]
-  {:id       (:id msg)
-   :ts       (:ts msg)
-   :from_id  (:from msg)
-   :ch       (:ch msg)
-   :type     (:type msg)
-   :v        (or (:v msg) 1)
-   :body     (json/encode (or (:body msg) {}))
-   :files    (json/encode (or (:files msg) []))
+  {:id (:id msg)
+   :ts (:ts msg)
+   :from_id (:from msg)
+   :ch (:ch msg)
+   :type (:type msg)
+   :v (or (:v msg) 1)
+   :body (json/encode (or (:body msg) {}))
+   :files (json/encode (or (:files msg) []))
    :reply_to (:reply-to msg)})
 
 ;; ─────────────────────────────────────────────
@@ -229,11 +231,11 @@
 
 (defn handle-publish! [req ch]
   (let [body (parse-body req)
-        msg  (merge body
-                    {:id (new-ulid)
-                     :ts (now)
-                     :ch ch})
-        row  (msg->row msg)
+        msg (merge body
+                   {:id (new-ulid)
+                    :ts (now)
+                    :ch ch})
+        row (msg->row msg)
         encoded (json/encode msg)]
     (when (str/blank? (:from msg))
       (throw (ex-info "missing :from" {})))
@@ -249,40 +251,40 @@
 
 (defn handle-stream [req ch]
   (http/as-channel req
-                   {:on-open  (fn [client]
-                                (http/send! client
-                                            {:status 200
-                                             :headers {"Content-Type"  "text/event-stream"
-                                                       "Cache-Control" "no-cache"
-                                                       "Access-Control-Allow-Origin" "*"}})
-                                (sub! ch client))
+                   {:on-open (fn [client]
+                               (http/send! client
+                                           {:status 200
+                                            :headers {"Content-Type" "text/event-stream"
+                                                      "Cache-Control" "no-cache"
+                                                      "Access-Control-Allow-Origin" "*"}})
+                               (sub! ch client))
                     :on-close (fn [client _] (unsub! ch client))}))
 
 (defn handle-history [req ch]
-  (let [params      (:query-params req)
-        since       (get params "since")
+  (let [params (:query-params req)
+        since (get params "since")
         type-filter (get params "type")
         n-requested (try (Integer/parseInt (get params "n" (str history-limit)))
                          (catch Exception _ history-limit))
-        n-clamped   (min n-requested history-limit)
-        rows        (cond
-                      (and since type-filter)
-                      (db-query
-                       "SELECT * FROM messages WHERE ch=? AND id>? AND type LIKE ? ORDER BY id DESC LIMIT ?"
-                       ch since (str type-filter "%") n-clamped)
-                      since
-                      (db-query
-                       "SELECT * FROM messages WHERE ch=? AND id>? ORDER BY id DESC LIMIT ?"
-                       ch since n-clamped)
-                      type-filter
-                      (db-query
-                       "SELECT * FROM messages WHERE ch=? AND type LIKE ? ORDER BY id DESC LIMIT ?"
-                       ch (str type-filter "%") n-clamped)
-                      :else
-                      (db-query
-                       "SELECT * FROM messages WHERE ch=? ORDER BY id DESC LIMIT ?"
-                       ch n-clamped))
-        msgs        (->> rows (map row->msg) reverse)]
+        n-clamped (min n-requested history-limit)
+        rows (cond
+               (and since type-filter)
+               (db-query
+                "SELECT * FROM messages WHERE ch=? AND id>? AND type LIKE ? ORDER BY id DESC LIMIT ?"
+                ch since (str type-filter "%") n-clamped)
+               since
+               (db-query
+                "SELECT * FROM messages WHERE ch=? AND id>? ORDER BY id DESC LIMIT ?"
+                ch since n-clamped)
+               type-filter
+               (db-query
+                "SELECT * FROM messages WHERE ch=? AND type LIKE ? ORDER BY id DESC LIMIT ?"
+                ch (str type-filter "%") n-clamped)
+               :else
+               (db-query
+                "SELECT * FROM messages WHERE ch=? ORDER BY id DESC LIMIT ?"
+                ch n-clamped))
+        msgs (->> rows (map row->msg) reverse)]
     {:status 200
      :headers {"Content-Type" "application/x-ndjson"
                "Access-Control-Allow-Origin" "*"}
@@ -294,15 +296,18 @@
 
 (defn handle-task-create! [req]
   (let [body (parse-body req)
-        id   (new-ulid)
-        ts   (now)
-        ch   (or (:ch body) "tasks")]
+        id (new-ulid)
+        ts (now)
+        ch (or (:ch body) "tasks")
+        from (or (:from body) (:created_by body))]
+    (when (str/blank? from)
+      (throw (ex-info "missing :from or :created_by" {:status 400})))
     (when (str/blank? (:title body))
-      (throw (ex-info "missing :title" {})))
+      (throw (ex-info "missing :title" {:status 400})))
     (db-exec!
      "INSERT INTO tasks (id,created_at,updated_at,created_by,assigned_to,status,title,context,files,ch)
       VALUES (?,?,?,?,?,?,?,?,?,?)"
-     id ts ts (:from body)
+     id ts ts from
      (:for body)
      "open"
      (:title body)
@@ -310,7 +315,7 @@
      (json/encode [])
      ch)
     ;; announce to channel
-    (let [msg {:id (new-ulid) :ts ts :from (:from body)
+    (let [msg {:id (new-ulid) :ts ts :from from
                :ch ch :type "task.created"
                :body {:task-id id :title (:title body) :for (:for body)}}]
       (db-exec!
@@ -325,31 +330,31 @@
   (first (db-query "SELECT * FROM tasks WHERE id=?" id)))
 
 (defn handle-task-list [req]
-  (let [params  (:query-params req)
-        status  (get params "status")
+  (let [params (:query-params req)
+        status (get params "status")
         for-who (get params "for")
-        sql     (cond
-                  (and status for-who)
-                  ["SELECT * FROM tasks WHERE status=? AND (assigned_to=? OR claimed_by=?) ORDER BY created_at DESC" status for-who for-who]
-                  status
-                  ["SELECT * FROM tasks WHERE status=? ORDER BY created_at DESC" status]
-                  for-who
-                  ["SELECT * FROM tasks WHERE assigned_to=? OR claimed_by=? ORDER BY created_at DESC" for-who for-who]
-                  :else
-                  ["SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100"])
-        rows    (apply db-query sql)
-        tasks   (map (fn [r]
-                       (-> r
-                           (update :context #(json/parse-string % true))
-                           (update :files #(json/parse-string % true)))) rows)]
+        sql (cond
+              (and status for-who)
+              ["SELECT * FROM tasks WHERE status=? AND (assigned_to=? OR claimed_by=?) ORDER BY created_at DESC" status for-who for-who]
+              status
+              ["SELECT * FROM tasks WHERE status=? ORDER BY created_at DESC" status]
+              for-who
+              ["SELECT * FROM tasks WHERE assigned_to=? OR claimed_by=? ORDER BY created_at DESC" for-who for-who]
+              :else
+              ["SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100"])
+        rows (apply db-query sql)
+        tasks (map (fn [r]
+                     (-> r
+                         (update :context #(json/parse-string % true))
+                         (update :files #(json/parse-string % true)))) rows)]
     (ok tasks)))
 
 (defn handle-task-claim! [req id]
   (let [body (parse-body req)
         agent (:from body)
-        task  (get-task id)]
+        task (get-task id)]
     (cond
-      (nil? task)        (not-found "task not found")
+      (nil? task) (not-found "task not found")
       (not= (:status task) "open") (conflict "task already claimed or closed")
       :else
       (do
@@ -359,8 +364,8 @@
          agent (now) (now) id)
         (let [updated (get-task id)]
           (when (= (:claimed_by updated) agent)
-            (let [ts  (now)
-                  ch  (:ch task)
+            (let [ts (now)
+                  ch (:ch task)
                   msg {:id (new-ulid) :ts ts :from agent
                        :ch ch :type "task.claimed"
                        :body {:task-id id :title (:title task)}}]
@@ -378,8 +383,8 @@
     (when (nil? task)
       (throw (ex-info "task not found" {:status 404})))
     (db-exec! "UPDATE tasks SET updated_at=? WHERE id=?" (now) id)
-    (let [ts  (now)
-          ch  (:ch task)
+    (let [ts (now)
+          ch (:ch task)
           msg {:id (new-ulid) :ts ts :from (:from body)
                :ch ch :type "task.updated"
                :body (merge {:task-id id} (dissoc body :from))}]
@@ -400,8 +405,8 @@
     (db-exec!
      "UPDATE tasks SET status='done', updated_at=?, result=?, files=? WHERE id=?"
      (now) (json/encode (or (:result body) {})) (json/encode files) id)
-    (let [ts  (now)
-          ch  (:ch task)
+    (let [ts (now)
+          ch (:ch task)
           msg {:id (new-ulid) :ts ts :from (:from body)
                :ch ch :type "task.done"
                :body {:task-id id :title (:title task)}
@@ -422,8 +427,8 @@
     (db-exec!
      "UPDATE tasks SET status='open', claimed_by=NULL, claimed_at=NULL, updated_at=? WHERE id=?"
      (now) id)
-    (let [ts  (now)
-          ch  (:ch task)
+    (let [ts (now)
+          ch (:ch task)
           msg {:id (new-ulid) :ts ts :from (:from body)
                :ch ch :type "task.abandoned"
                :body {:task-id id :title (:title task)}}]
@@ -440,8 +445,8 @@
         task (get-task id)]
     (when (nil? task)
       (throw (ex-info "task not found" {:status 404})))
-    (let [ts  (now)
-          ch  (:ch task)
+    (let [ts (now)
+          ch (:ch task)
           msg {:id (new-ulid) :ts ts :from (:from body)
                :ch ch :type "task.interrupt"
                :body {:task-id id :title (:title task) :reason (:reason body)}}]
@@ -459,18 +464,18 @@
 
 (defn sha256-hex [bytes]
   (let [md (java.security.MessageDigest/getInstance "SHA-256")
-        h  (.digest md bytes)]
+        h (.digest md bytes)]
     (apply str (map #(format "%02x" (bit-and % 0xff)) h))))
 
 (defn handle-file-upload! [req]
   (let [content-length (some-> req :headers (get "content-length") Integer/parseInt)]
     (when (and content-length (> content-length max-file-size))
       (throw (ex-info (str "file too large, max " max-file-size " bytes") {:status 413})))
-    (let [bytes   (-> req :body .readAllBytes)]
+    (let [bytes (-> req :body .readAllBytes)]
       (when (> (count bytes) max-file-size)
         (throw (ex-info (str "file too large, max " max-file-size " bytes") {:status 413})))
-      (let [hash    (str "sha256:" (sha256-hex bytes))
-            path    (str blobs-dir "/" hash)]
+      (let [hash (str "sha256:" (sha256-hex bytes))
+            path (str blobs-dir "/" hash)]
         (.mkdirs (io/file blobs-dir))
         (when-not (.exists (io/file path))
           (with-open [out (io/output-stream path)]
@@ -479,10 +484,10 @@
 
 (defn handle-file-fetch [_req hash]
   (let [path (str blobs-dir "/" hash)
-        f    (io/file path)]
+        f (io/file path)]
     (if (.exists f)
       {:status 200
-       :headers {"Content-Type"   "application/octet-stream"
+       :headers {"Content-Type" "application/octet-stream"
                  "Content-Length" (str (.length f))
                  "Access-Control-Allow-Origin" "*"}
        :body f}
@@ -511,8 +516,8 @@
 
 (defn handle-presence-list [_req]
   (let [cutoff (- (now) (/ presence-ttl-ms 1000))
-        rows   (db-query
-                "SELECT * FROM presence WHERE last_seen > ?" cutoff)
+        rows (db-query
+              "SELECT * FROM presence WHERE last_seen > ?" cutoff)
         agents (map (fn [r]
                       (-> r
                           (update :channels #(json/parse-string % true))
@@ -532,9 +537,9 @@
                                     "SELECT COUNT(*) as count FROM presence WHERE last_seen > ?"
                                     (- (now) (/ presence-ttl-ms 1000)))))
         uptime-s (/ (- (System/currentTimeMillis) start-time) 1000.0)]
-    (ok {:uptime-s    uptime-s
-         :messages    msg-count
-         :tasks       task-count
+    (ok {:uptime-s uptime-s
+         :messages msg-count
+         :tasks task-count
          :agents-live agent-count
          :subscribers (reduce + 0 (map count (vals @subscribers)))})))
 
@@ -1292,17 +1297,17 @@ loadHistory().then(() => {
 ;; cond-based router — no core.match dep needed in babashka
 (defn route [req]
   (let [method (:request-method req)
-        uri    (:uri req)
-        path   (str/replace uri #"\?.*" "")
-        parts  (str/split path #"/")]
+        uri (:uri req)
+        path (str/replace uri #"\?.*" "")
+        parts (str/split path #"/")]
     (try
       (cond
-        (= [:get "/"]  [method path])   (handle-stream req :all)
-        (= [:get "/ui"] [method path])  (handle-ui req)
+        (= [:get "/"] [method path]) (handle-stream req :all)
+        (= [:get "/ui"] [method path]) (handle-ui req)
         (= [:get "/status"] [method path]) (handle-status req)
 
         (= [:post "/presence"] [method path]) (handle-presence-heartbeat! req)
-        (= [:get  "/presence"] [method path]) (handle-presence-list req)
+        (= [:get "/presence"] [method path]) (handle-presence-list req)
 
         (and (= method :post)
              (re-matches #"/ch/[^/]+" path))
@@ -1317,7 +1322,7 @@ loadHistory().then(() => {
         (handle-stream req (get parts 2))
 
         (= [:post "/tasks"] [method path]) (handle-task-create! req)
-        (= [:get  "/tasks"] [method path]) (handle-task-list req)
+        (= [:get "/tasks"] [method path]) (handle-task-list req)
 
         (and (= method :post)
              (re-matches #"/tasks/[^/]+/claim" path))
