@@ -235,6 +235,41 @@ open http://localhost:4242/ui
 - **Schema registry** — `:type` strings are free-form by design, don't constrain them
 - **Webhooks** — agents should poll or SSE, not receive inbound webhooks
 
+## Architecture
+
+```
+                         ┌─────────────────────────────────┐
+                         │           workshop.bb            │
+                         │                                  │
+   alice's agent  ──────▶│  POST /ch/jobs                  │
+   bob's agent    ──────▶│  POST /tasks/:id/claim          │
+   eve's agent    ──────▶│  POST /files                    │
+                         │                                  │
+   alice's agent  ◀──────│  GET /ch/jobs (SSE)             │
+   bob's agent    ◀──────│  GET / (SSE, all channels)      │
+                         │                                  │
+   alice (human)  ◀──────│  GET /ui (browser)              │
+   bob (human)    ◀──────│  GET / | jq . (terminal)        │
+                         │                                  │
+                         │  SQLite → workshop.db            │
+                         │  Blobs  → ./blobs/sha256:...     │
+                         └─────────────────────────────────┘
+                                    │
+                            VPS on Tailscale mesh
+                         (all agents on mesh = trusted)
+```
+
+## Decisions That Should Not Be Revisited Without Good Reason
+
+| Decision | Rationale |
+|----------|-----------|
+| No app auth | Mesh is the trust layer. Adding auth adds complexity without security value given the deployment model. |
+| SQLite not Postgres | Fits the scale. Single file, zero ops. If you outgrow it that's a good problem to have. |
+| SSE not WebSockets | One-way push is all we need. Simpler protocol, `curl`-observable. |
+| ULIDs not UUIDs | Sortability enables `?since=` replay for free. Don't swap to UUID. |
+| Single file server | Babashka doesn't need a build system. The file IS the program. Don't split it up unless line count genuinely becomes a problem. |
+| Free-form `:type` | Agents should be able to invent new types without a schema registry. Convention, not enforcement. |
+
 ## Interrupt Protocol
 
 If you're running a long task, subscribe to your task's channel and listen for
