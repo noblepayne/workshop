@@ -5,7 +5,10 @@
 
 (require '[babashka.http-client :as http]
          '[cheshire.core :as json]
-         '[babashka.pods :as pods])
+         '[babashka.pods :as pods]
+         '[babashka.process :as process]
+         '[clojure.java.io :as io]
+         '[clojure.string :as str])
 
 (pods/load-pod 'org.babashka/go-sqlite3 "0.3.13")
 (require '[pod.babashka.go-sqlite3 :as sqlite])
@@ -45,6 +48,21 @@
 (defn GET [path]
   (let [resp (http/get (str base-url path))]
     (json/parse-string (:body resp) true)))
+
+(defn GET* [path]
+  "GET that returns status + body (for error codes)"
+  (let [resp (http/get (str base-url path) {:throw false})]
+    {:status (:status resp)
+     :body (some-> (:body resp) (json/parse-string true))}))
+
+(defn POST-raw [path raw-body content-type]
+  "POST raw string (for malformed JSON tests)"
+  (let [resp (http/post (str base-url path)
+                        {:body raw-body
+                         :headers {"Content-Type" content-type}
+                         :throw false})]
+    {:status (:status resp)
+     :body (some-> (:body resp) (json/parse-string true))}))
 
 (defn -main [& _]
   (println "Running smoke tests against" base-url)
@@ -101,6 +119,75 @@
                 resp (POST* (str "/tasks/" tid "/claim") {:from "agent2"})]
             (assert (= 409 (:status resp)) "second claim should return 409")
             (assert (:error (:body resp)))))
+
+  (test! "global history returns ndjson"
+         #(let [;; publish a message we can find
+                _ (POST "/ch/history-test" {:from "test" :type "test.history" :body {:msg "findme"}})
+                ;; fetch global history
+                resp (http/get (str base-url "/history?n=10") {:throw false})
+                body (:body resp)]
+            (assert (= 200 (:status resp)) "history should return 200")
+            (assert (string? body) "history should return ndjson string")
+            (assert (str/includes? body "findme") "history should contain our message")))
+
+  (test! "channels list returns known channels"
+         #(let [chans (GET "/channels")]
+            (assert (coll? chans) "channels should return a collection")
+            (assert (some #{"general" "tasks"} chans) "should contain known channels")))
+
+  (test! "single task fetch returns task"
+         #(let [task (POST "/tasks" {:from "test" :title "fetch test" :context {}})
+                tid (:id task)
+                fetched (GET (str "/tasks/" tid))]
+            (assert (= tid (:id fetched)) "should return the same task")
+            (assert (= "fetch test" (:title fetched)) "should have correct title")))
+
+  (test! "single task fetch returns 404 for unknown"
+         #(let [resp (GET* "/tasks/01XXXXXXXXXXXXXXXXXXXXXX")]
+            (assert (= 404 (:status resp)) "unknown task should return 404")))
+
+  (test! "task done on open returns 409"
+         #(let [task (POST "/tasks" {:from "test" :title "done open test" :context {}})
+                tid (:id task)
+                resp (POST* (str "/tasks/" tid "/done") {:from "test" :result {:done true}})]
+            (assert (= 409 (:status resp)) "cannot done an open task")
+            (assert (:error (:body resp)))))
+
+  (test! "task done by non-owner returns 403"
+         #(let [task (POST "/tasks" {:from "test" :title "owner test" :context {}})
+                tid (:id task)
+                ;; agent1 claims it
+                _ (POST* (str "/tasks/" tid "/claim") {:from "agent1"})
+                ;; agent2 tries to complete it
+                resp (POST* (str "/tasks/" tid "/done") {:from "agent2" :result {:done true}})]
+            (assert (= 403 (:status resp)) "non-owner cannot mark done")
+            (assert (:error (:body resp)))))
+
+  (test! "task abandon on open returns 409"
+         #(let [task (POST "/tasks" {:from "test" :title "abandon open test" :context {}})
+                tid (:id task)
+                resp (POST* (str "/tasks/" tid "/abandon") {:from "test"})]
+            (assert (= 409 (:status resp)) "cannot abandon an open task")
+            (assert (:error (:body resp)))))
+
+  (test! "task abandon by non-owner returns 403"
+         #(let [task (POST "/tasks" {:from "test" :title "abandon owner test" :context {}})
+                tid (:id task)
+                ;; agent1 claims it
+                _ (POST* (str "/tasks/" tid "/claim") {:from "agent1"})
+                ;; agent2 tries to abandon it
+                resp (POST* (str "/tasks/" tid "/abandon") {:from "agent2"})]
+            (assert (= 403 (:status resp)) "non-owner cannot abandon")
+            (assert (:error (:body resp)))))
+
+  (test! "malformed JSON returns 400"
+         #(let [resp (POST-raw "/ch/general" "{invalid json" "application/json")]
+            (assert (= 400 (:status resp)) "malformed JSON should return 400")
+            (assert (:error (:body resp)))))
+
+  (test! "file path traversal returns 400"
+         #(let [resp (GET* "/files/sha256:../../etc/passwd")]
+            (assert (= 400 (:status resp)) "path traversal should return 400")))
 
   (test! "presence heartbeat"
          #(let [r (POST "/presence" {:from "test" :channels ["general"] :meta {}})]
@@ -193,6 +280,54 @@
             (assert (>= ts before) "ULID timestamp must be >= time before generation")
             (assert (<= ts after)  "ULID timestamp must be <= time after generation")
             (assert (= 26 (count id)) "ULID must be 26 characters")))
+
+  (defn sse-read-lines [stream timeout-ms]
+    "Read lines from an SSE stream within timeout"
+    (let [lines (atom [])
+          done (atom false)]
+      (future
+        (try
+          (while (not @done)
+            (let [line (.readLine stream)]
+              (when line (swap! lines conj line))))
+          (catch Exception _)))
+      (Thread/sleep timeout-ms)
+      (reset! done true)
+      (Thread/sleep 100)
+      @lines))
+
+  (test! "SSE streams messages in real-time"
+         (let [ch "test-sse-stream"]
+           (fn []
+             (let [proc (process/process ["curl" "-sN" (str base-url "/ch/" ch)])
+                   stream (io/reader (:out proc))]
+               (Thread/sleep 500)
+               (POST (str "/ch/" ch) {:from "test" :type "test.sse" :body {:msg "hello"}})
+               (let [lines (sse-read-lines stream 2000)]
+                 (process/destroy-tree proc)
+                 (assert (seq lines) "should receive SSE data")
+                 (assert (some (fn [x] (str/includes? x "hello")) lines) "should contain our message"))))))
+
+  (test! "SSE includes id field"
+         (let [ch "test-sse-id"]
+           (fn []
+             (let [proc (process/process ["curl" "-sN" (str base-url "/ch/" ch)])
+                   stream (io/reader (:out proc))]
+               (Thread/sleep 500)
+               (POST (str "/ch/" ch) {:from "test" :type "test.id" :body {:msg "idtest"}})
+               (let [lines (sse-read-lines stream 2000)]
+                 (process/destroy-tree proc)
+                 (assert (some (fn [x] (re-find #"^id:" x)) lines) "should have id: prefix"))))))
+
+  (test! "SSE keepalive ping"
+         (let [ch "test-sse-keepalive"]
+           (fn []
+             (let [proc (process/process ["curl" "-sN" (str base-url "/ch/" ch)])
+                   stream (io/reader (:out proc))]
+               (Thread/sleep 500)
+               (let [lines (sse-read-lines stream 25000)]
+                 (process/destroy-tree proc)
+                 (assert (some (fn [x] (re-find #"^: " x)) lines) "should receive keepalive ping"))))))
 
   (println "=" 50)
   (println (format "Results: %d passed, %d failed" @passes @fails))
