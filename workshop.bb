@@ -275,29 +275,36 @@
 
 (defn handle-stream [req ch]
   ;; Replay any missed messages if client sends Last-Event-ID on reconnect.
-  ;; This ensures no messages are lost during brief disconnections.
-  (let [last-id (get-in req [:headers "last-event-id"])
-        missed  (when (and last-id (not= ch :all))
-                  (->> (db-query
-                        "SELECT * FROM messages WHERE ch=? AND id>? ORDER BY id ASC"
-                        (if (= ch :all) nil ch) last-id)
-                       (map row->msg)))
-        missed-all (when (and last-id (= ch :all))
-                     (->> (db-query
-                           "SELECT * FROM messages WHERE id>? ORDER BY id ASC"
-                           last-id)
-                          (map row->msg)))]
-    (http/as-channel req
-                     {:init     {:status 200 :headers sse-headers}
-                      :on-open  (fn [client]
-                   ;; Replay gap before subscribing.
-                   ;; Any message published between the gap query and sub! may arrive
-                   ;; twice — the client-side seenIds dedup handles this gracefully.
-                                  (doseq [msg (or missed missed-all)]
-                                    (let [frame (str "id: " (:id msg) "\ndata: " (json/encode msg) "\n\n")]
-                                      (http/send! client frame)))
-                                  (sub! ch client))
-                      :on-close (fn [client _] (unsub! ch client))})))
+  ;; This ensures no messages are lost during brief disconnects.
+  (let [method (:request-method req)]
+    ;; HEAD request: just return headers, no body (for browser EventSource preflight)
+    (if (= method :head)
+      {:status 200 :headers sse-headers}
+      ;; GET request: set up SSE channel
+      ;; Note: Don't use :init - send headers via send! in :on-open so they flush immediately
+      ;; Firefox EventSource needs headers sent before it transitions to OPEN state
+      (let [last-id (get-in req [:headers "last-event-id"])
+            missed  (when (and last-id (not= ch :all))
+                      (->> (db-query
+                            "SELECT * FROM messages WHERE ch=? AND id>? ORDER BY id ASC"
+                            (if (= ch :all) nil ch) last-id)
+                           (map row->msg)))
+            missed-all (when (and last-id (= ch :all))
+                         (->> (db-query
+                               "SELECT * FROM messages WHERE id>? ORDER BY id ASC"
+                               last-id)
+                              (map row->msg)))]
+        (http/as-channel req
+                         {:on-open  (fn [client]
+                                      ;; Send headers first so Firefox EventSource transitions to OPEN
+                                      (http/send! client {:status 200 :headers sse-headers} false)
+                                      ;; Send missed messages if reconnecting
+                                      (doseq [msg (or missed missed-all)]
+                                        (let [frame (str "id: " (:id msg) "\ndata: " (json/encode msg) "\n\n")]
+                                          (http/send! client frame)))
+                                      ;; Subscribe for live updates
+                                      (sub! ch client))
+                          :on-close (fn [client _] (unsub! ch client))})))))
 
 (defn handle-history [req ch]
   (let [params      (:query-params req)
@@ -1296,6 +1303,7 @@ async function loadHistory() {
       (cond
         ;; ── global ──
         (= [:get "/"]        [method path]) (handle-stream req :all)
+        (= [:head "/"]      [method path]) (handle-stream req :all)
         (= [:get "/ui"]      [method path]) (handle-ui req)
         (= [:get "/status"]  [method path]) (handle-status req)
         (= [:get "/history"] [method path]) (handle-global-history req)
@@ -1314,6 +1322,9 @@ async function loadHistory() {
 
         (and (= method :get) (re-matches #"/ch/[^/]+" path))
         (handle-stream req (get parts 2))
+
+        (and (= method :get) (re-matches #"/ch/[^/]+/history" path))
+        (handle-history req (get parts 2))
 
         ;; ── tasks ──
         (= [:post "/tasks"] [method path]) (handle-task-create! req)
@@ -1347,7 +1358,7 @@ async function loadHistory() {
         (= method :options)
         {:status 204
          :headers {"Access-Control-Allow-Origin"  "*"
-                   "Access-Control-Allow-Methods" "GET,POST,OPTIONS"
+                   "Access-Control-Allow-Methods" "GET,HEAD,POST,OPTIONS"
                    "Access-Control-Allow-Headers" "Content-Type,Last-Event-ID"
                    "Access-Control-Max-Age"       "86400"}}
 
