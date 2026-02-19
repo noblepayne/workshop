@@ -274,35 +274,38 @@
     (created {:id (:id msg) :ts (:ts msg)})))
 
 (defn handle-stream [req ch]
-  ;; Replay any missed messages if client sends Last-Event-ID on reconnect.
-  ;; This ensures no messages are lost during brief disconnects.
   (let [method (:request-method req)]
-    ;; HEAD request: just return headers, no body (for browser EventSource preflight)
     (if (= method :head)
       {:status 200 :headers sse-headers}
-      ;; GET request: set up SSE channel
-      ;; Note: Don't use :init - send headers via send! in :on-open so they flush immediately
-      ;; Firefox EventSource needs headers sent before it transitions to OPEN state
-      (let [last-id (get-in req [:headers "last-event-id"])
-            missed  (when (and last-id (not= ch :all))
-                      (->> (db-query
-                            "SELECT * FROM messages WHERE ch=? AND id>? ORDER BY id ASC"
-                            (if (= ch :all) nil ch) last-id)
-                           (map row->msg)))
-            missed-all (when (and last-id (= ch :all))
-                         (->> (db-query
-                               "SELECT * FROM messages WHERE id>? ORDER BY id ASC"
-                               last-id)
-                              (map row->msg)))]
+      (let [last-id    (get-in req [:headers "last-event-id"])
+            missed     (when last-id
+                         (if (= ch :all)
+                           (->> (db-query
+                                 "SELECT * FROM messages WHERE id>? ORDER BY id ASC"
+                                 last-id)
+                                (map row->msg))
+                           (->> (db-query
+                                 "SELECT * FROM messages WHERE ch=? AND id>? ORDER BY id ASC"
+                                 ch last-id)
+                                (map row->msg))))]
         (http/as-channel req
                          {:on-open  (fn [client]
-                                      ;; Send headers first so Firefox EventSource transitions to OPEN
-                                      (http/send! client {:status 200 :headers sse-headers} false)
-                                      ;; Send missed messages if reconnecting
-                                      (doseq [msg (or missed missed-all)]
-                                        (let [frame (str "id: " (:id msg) "\ndata: " (json/encode msg) "\n\n")]
-                                          (http/send! client frame)))
-                                      ;; Subscribe for live updates
+                       ;; First send MUST include status+headers+body together.
+                       ;; The body here is a SSE comment, which flushes the response
+                       ;; and transitions Firefox EventSource from CONNECTING to OPEN.
+                       ;; Headers are only applied on this first send; subsequent sends
+                       ;; are treated as stream chunks (status/headers stripped).
+                                      (http/send! client
+                                                  {:status  200
+                                                   :headers sse-headers
+                                                   :body    ": open\n\n"}
+                                                  false)
+                       ;; Replay any missed messages (reconnect support)
+                                      (doseq [msg missed]
+                                        (http/send! client
+                                                    (str "id: " (:id msg) "\ndata: " (json/encode msg) "\n\n")
+                                                    false))
+                       ;; Subscribe for live broadcasts
                                       (sub! ch client))
                           :on-close (fn [client _] (unsub! ch client))})))))
 
@@ -1321,6 +1324,9 @@ async function loadHistory() {
         (handle-history req (get parts 2))
 
         (and (= method :get) (re-matches #"/ch/[^/]+" path))
+        (handle-stream req (get parts 2))
+
+        (and (= method :head) (re-matches #"/ch/[^/]+" path))
         (handle-stream req (get parts 2))
 
         (and (= method :get) (re-matches #"/ch/[^/]+/history" path))
