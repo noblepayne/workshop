@@ -301,7 +301,7 @@
            (fn []
              (let [proc (process/process ["curl" "-sN" (str base-url "/ch/" ch)])
                    stream (io/reader (:out proc))]
-               (Thread/sleep 500)
+               (Thread/sleep 1000)
                (POST (str "/ch/" ch) {:from "test" :type "test.sse" :body {:msg "hello"}})
                (let [lines (sse-read-lines stream 2000)]
                  (process/destroy-tree proc)
@@ -313,11 +313,40 @@
            (fn []
              (let [proc (process/process ["curl" "-sN" (str base-url "/ch/" ch)])
                    stream (io/reader (:out proc))]
-               (Thread/sleep 500)
+               (Thread/sleep 1000)
                (POST (str "/ch/" ch) {:from "test" :type "test.id" :body {:msg "idtest"}})
                (let [lines (sse-read-lines stream 2000)]
                  (process/destroy-tree proc)
                  (assert (some (fn [x] (re-find #"^id:" x)) lines) "should have id: prefix"))))))
+
+  (test! "SSE Last-Event-ID replays missed messages"
+         (fn []
+           (let [ch (str "test-sse-replay-" (System/currentTimeMillis))
+                 path (str "/ch/" ch)]
+             ;; Step 1: Connect and capture first message ID from the stream itself
+             (let [proc1 (process/process ["curl" "-sN" (str base-url path)])
+                   stream1 (io/reader (:out proc1))]
+               (Thread/sleep 500)
+               ;; Publish first message
+               (POST path {:from "test" :type "test.replay" :body {:n 1}})
+               ;; Read from stream to get the message and its ID
+               (let [lines1 (sse-read-lines stream1 2000)
+                     id-line (some (fn [x] (when (str/starts-with? x "id:") x)) lines1)
+                     msg1-id (second (re-find #"id: (\S+)" id-line))]
+                 (process/destroy-tree proc1)
+                  (assert msg1-id (str "should capture first message ID, got lines: " lines1))
+                 
+                 ;; Step 2: Reconnect with Last-Event-ID to get only NEW messages
+                 (let [proc2 (process/process ["curl" "-sN" "-H" (str "Last-Event-ID: " msg1-id) (str base-url path)])
+                       stream2 (io/reader (:out proc2))]
+                   (Thread/sleep 500)
+                   ;; Publish second message
+                   (POST path {:from "test" :type "test.replay" :body {:n 2}})
+                   (let [lines2 (sse-read-lines stream2 2000)]
+                     (process/destroy-tree proc2)
+                     ;; Should only receive n=2, NOT n=1 (because we specified Last-Event-ID)
+                     (assert (not (some (fn [x] (str/includes? x "\"n\":1")) lines2)) "should not receive first message again")
+                     (assert (some (fn [x] (str/includes? x "\"n\":2")) lines2) "should receive second message"))))))))
 
   (test! "SSE keepalive ping"
          (let [ch "test-sse-keepalive"]
